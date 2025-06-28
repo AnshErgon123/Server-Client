@@ -57,7 +57,15 @@ def scan_for_unit_id(bus, timeout=5):
     print("Scanning for unit ID...")
     start = time.time()
     while time.time() - start < timeout:
-        msg = bus.recv(timeout=1)
+        try:
+            msg = bus.recv(timeout=1)
+        except can.CanError as e:
+            print(f"⚠️ CAN error during scan: {e}")
+            send_status("pcan_failed")
+            global flag
+            flag = 1
+            return None
+
         if msg and len(msg.data) >= 2 and msg.arbitration_id != 0x8:
             unit_id = (msg.data[0] << 8) | msg.data[1]
             print(f"Unit ID: {unit_id}")
@@ -137,11 +145,11 @@ def handle_firmware_download(unit_id):
         if r.status_code == 200:
             with open(local_path, "wb") as f:
                 f.write(r.content)
-            print(" Firmware downloaded.")
+            print("✅ Firmware downloaded.")
             decrypt_firmware_package(local_path, FIRMWARE_KEY, output_folder="./decrypted")
             return True
         else:
-            print("Download failed.")
+            print("❌ Download failed.")
             return False
     except Exception as e:
         print(f"Error: {e}")
@@ -156,8 +164,8 @@ def decrypt_firmware_package(ergon_path, key, output_folder):
     decrypted_zip_data = fernet.decrypt(encrypted_data)
     with zipfile.ZipFile(io.BytesIO(decrypted_zip_data)) as zipf:
         zipf.extractall(output_folder)
-    print(f" Extracted to {output_folder}")
-    print(" Decrypted contents:", os.listdir(output_folder))
+    print(f"✅ Extracted to {output_folder}")
+    print("📂 Decrypted contents:", os.listdir(output_folder))
     requests.post(f"{BRIDGE_URL}/reset")
 
 def calc_CRC(data):
@@ -192,7 +200,7 @@ def send_bytes(bus, data, size, delay_t, total, crc, data_size):
     while i < len(data):
         try:
             if bus.status() == PCAN_ERROR_ILLHW:
-                print("\n PCAN disconnected during flashing!")
+                print("\n❌ PCAN disconnected during flashing!")
                 send_status("pcan_failed")
                 flashing_flag[0] = False
                 requests.post(f"{BRIDGE_URL}/reset")
@@ -217,10 +225,10 @@ def send_bytes(bus, data, size, delay_t, total, crc, data_size):
             percentage = round((total_frames / total) * 100, 2)
             print(f"Updating.... : {percentage}%  Frames : {total_frames}", end='\r')
             if percentage == 100.0:
-                print("\n Update completed successfully")
+                print("\n✅ Update completed successfully")
             time.sleep(delay_t)
         except CanError:
-            print("\n CAN send failed — aborting")
+            print("\n❌ CAN send failed — aborting")
             send_status("pcan_failed")
             flashing_flag[0] = False
             requests.post(f"{BRIDGE_URL}/reset")
@@ -228,7 +236,7 @@ def send_bytes(bus, data, size, delay_t, total, crc, data_size):
             return
 
         i += size
-    # bus.flush_rx_buffer()
+
 
 def clean_hex_data(data):
     return re.sub(r'[^0-9A-Fa-f]', '', data)
@@ -283,6 +291,7 @@ def main():
         return
     send_status("pcan_connected")
     unit_id = None
+    idle_counter = 0
     threading.Thread(target=check_connection, daemon=True).start()
     while True:
         if flag == 1:
@@ -294,9 +303,14 @@ def main():
                 continue
         cmd = poll_next_command()
         if not cmd:
+            idle_counter += 1
+            if idle_counter % 30 == 0:
+                print("🟡 Idle... waiting for command.")
             time.sleep(1)
             continue
-        print(f"\n Command: {cmd}")
+        else:
+            idle_counter = 0
+
         if cmd == "scan_unit":
             unit_id = scan_for_unit_id(bus)
             if not unit_id:
@@ -306,7 +320,7 @@ def main():
             if key_bytes:
                 success = send_security_key(bus, key_bytes, unit_id)
                 if not success:
-                    print(" Security key handshake failed.")
+                    print("❌ Security key handshake failed.")
         elif cmd == "download_firmware" and unit_id:
             status = handle_firmware_download(unit_id)
             if status:
@@ -324,13 +338,14 @@ def main():
                 threading.Thread(target=send_heartbeat, daemon=True).start()
                 send_bytes(bus, application_data, 8, 0.030, total, crc, data_size)
                 flashing_flag[0] = False
+                print("✅ Firmware update complete. Cooling down before scanning...")
+                time.sleep(3)
         elif cmd == "wait_for_firmware":
-            print("⏳ Waiting for firmware selection from frontend...")
             time.sleep(2)
             continue
         elif cmd == "shutdown":
-            print("Shutting down...")
-            break
+            print("Ignoring shutdown and staying alive...")
+            continue
         time.sleep(1)
 
 if __name__ == "__main__":

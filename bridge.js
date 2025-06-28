@@ -37,6 +37,17 @@ app.get("/next-command", (req, res) => {
   res.json({ command: bridgeState.command });
 });
 
+// Trigger full handshake sequence from frontend
+app.post("/api/initiate-handshake", (req, res) => {
+  if (bridgeState.command !== "scan_unit") {
+    bridgeState.command = "scan_unit";
+    console.log("🟢 Handshake initiated by frontend.");
+    res.json({ success: true, message: "Handshake started." });
+  } else {
+    res.json({ success: false, message: "Handshake already in progress." });
+  }
+});
+
 // Receives unit ID from client and validates it
 app.post("/unit-id", (req, res) => {
   const { unit_id } = req.body;
@@ -64,7 +75,6 @@ app.get("/security-key/:unit_id", (req, res) => {
 });
 
 // Receives metadata from client and lets user select firmware file
-// In /unit-metadata route
 app.post("/unit-metadata", async (req, res) => {
   const { unit_id, metadata } = req.body;
   if (!unit_id || !metadata) return res.status(400).json({ error: "Missing unit_id or metadata" });
