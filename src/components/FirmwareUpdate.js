@@ -8,6 +8,7 @@ const FirmwareUpdate = () => {
   const [updating, setUpdating] = useState(false);
   const [message, setMessage] = useState('');
   const [bridgeStatus, setBridgeStatus] = useState(null);
+  const [flashingProgress, setFlashingProgress] = useState(null);
 
   const fetchFirmwares = async () => {
     try {
@@ -30,6 +31,24 @@ const FirmwareUpdate = () => {
     }
   };
 
+  const fetchFlashingProgress = async () => {
+    try {
+      const response = await axios.get('http://localhost:5000/api/flashing-progress');
+      if (response.data.progress) {
+        setFlashingProgress(response.data.progress);
+        
+        // Clear progress after 5 seconds if completed
+        if (response.data.progress.status === 'completed') {
+          setTimeout(() => {
+            setFlashingProgress(null);
+          }, 5000);
+        }
+      }
+    } catch (error) {
+      console.error('Error fetching flashing progress:', error);
+    }
+  };
+
   const handleUpdate = async () => {
     if (!selectedFirmware) {
       setMessage('Please select a firmware file');
@@ -38,6 +57,7 @@ const FirmwareUpdate = () => {
 
     setUpdating(true);
     setMessage('');
+    setFlashingProgress(null); // Clear previous progress
 
     try {
       const response = await axios.post('http://localhost:5000/api/update-firmware', {
@@ -58,9 +78,15 @@ const FirmwareUpdate = () => {
   useEffect(() => {
     fetchFirmwares();
     fetchBridgeStatus();
+    fetchFlashingProgress();
     // Poll for bridge status updates every 2 seconds
-    const interval = setInterval(fetchBridgeStatus, 2000);
-    return () => clearInterval(interval);
+    const statusInterval = setInterval(fetchBridgeStatus, 2000);
+    // Poll for flashing progress updates every 1 second when updating
+    const progressInterval = setInterval(fetchFlashingProgress, 1000);
+    return () => {
+      clearInterval(statusInterval);
+      clearInterval(progressInterval);
+    };
   }, []);
 
   if (loading) {
@@ -109,6 +135,28 @@ const FirmwareUpdate = () => {
                 : 'bg-green-50 text-green-700 border border-green-200'
             }`}>
               {message}
+            </div>
+          )}
+
+          {flashingProgress && (
+            <div className="p-4 bg-blue-50 border border-blue-200 rounded-md">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-sm font-medium text-blue-800">
+                  {flashingProgress.status === 'completed' ? '✅ Flashing Complete' : '🔄 Flashing in Progress'}
+                </h3>
+                <span className="text-sm font-medium text-blue-800">
+                  {flashingProgress.percentage}%
+                </span>
+              </div>
+              <div className="w-full bg-blue-200 rounded-full h-2 mb-2">
+                <div 
+                  className="bg-blue-600 h-2 rounded-full transition-all duration-300 ease-out"
+                  style={{ width: `${flashingProgress.percentage}%` }}
+                ></div>
+              </div>
+              <div className="text-xs text-blue-600">
+                Frame {flashingProgress.frames} of {flashingProgress.total_frames}
+              </div>
             </div>
           )}
 

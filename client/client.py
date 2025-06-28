@@ -9,6 +9,7 @@ bus = None
 retry_count = 0
 flag = 0
 flashing_flag = [False]
+ping_active_flag = [False]
 
 class BootloaderData:
     def __init__(self, security_key, bootloader_version, hardware_version,
@@ -38,9 +39,11 @@ def init_CAN_bus():
 
 def poll_next_command():
     try:
-        return requests.get(f"{BRIDGE_URL}/next-command").json().get("command")
+        response = requests.get(f"{BRIDGE_URL}/next-command")
+        data = response.json()
+        return data.get("command"), data.get("ping_active", False)
     except:
-        return None
+        return None, False
 
 def send_status(status, detail=""):
     try:
@@ -54,7 +57,6 @@ def send_heartbeat():
         time.sleep(2)
 
 def scan_for_unit_id(bus, timeout=5):
-    print("Scanning for unit ID...")
     start = time.time()
     while time.time() - start < timeout:
         try:
@@ -108,7 +110,6 @@ def send_metadata(unit_id, metadata):
 
 def send_security_key(bus, key_bytes, unit_id):
     for attempt in range(1, 4):
-        print(f"Attempt {attempt}: Sending security key...")
         try:
             msg = can.Message(arbitration_id=0x14444444, data=bytes(key_bytes), is_extended_id=False)
             bus.send(msg)
@@ -166,7 +167,7 @@ def decrypt_firmware_package(ergon_path, key, output_folder):
         zipf.extractall(output_folder)
     print(f"✅ Extracted to {output_folder}")
     print("📂 Decrypted contents:", os.listdir(output_folder))
-    requests.post(f"{BRIDGE_URL}/reset")
+    requests.post(f"{BRIDGE_URL}/soft-reset")
 
 def calc_CRC(data):
     block_size = (data[22] + (data[23] << 8)) * 2
@@ -203,14 +204,14 @@ def send_bytes(bus, data, size, delay_t, total, crc, data_size):
                 print("\n❌ PCAN disconnected during flashing!")
                 send_status("pcan_failed")
                 flashing_flag[0] = False
-                requests.post(f"{BRIDGE_URL}/reset")
+                requests.post(f"{BRIDGE_URL}/soft-reset")
                 flag = 1
                 return
         except Exception as e:
             print(f"Error during status check: {e}")
             send_status("pcan_failed")
             flashing_flag[0] = False
-            requests.post(f"{BRIDGE_URL}/reset")
+            requests.post(f"{BRIDGE_URL}/soft-reset")
             flag = 1
             return
 
@@ -224,14 +225,36 @@ def send_bytes(bus, data, size, delay_t, total, crc, data_size):
             total_frames += 1
             percentage = round((total_frames / total) * 100, 2)
             print(f"Updating.... : {percentage}%  Frames : {total_frames}", end='\r')
+            
+            # Send progress update to bridge
+            try:
+                requests.post(f"{BRIDGE_URL}/flashing-progress", json={
+                    "status": "flashing",
+                    "percentage": percentage,
+                    "frames": total_frames,
+                    "total_frames": total
+                })
+            except:
+                pass  # Don't fail if bridge is not available
+                
             if percentage == 100.0:
                 print("\n✅ Update completed successfully")
+                # Send completion status
+                try:
+                    requests.post(f"{BRIDGE_URL}/flashing-progress", json={
+                        "status": "completed",
+                        "percentage": 100.0,
+                        "frames": total_frames,
+                        "total_frames": total
+                    })
+                except:
+                    pass
             time.sleep(delay_t)
         except CanError:
             print("\n❌ CAN send failed — aborting")
             send_status("pcan_failed")
             flashing_flag[0] = False
-            requests.post(f"{BRIDGE_URL}/reset")
+            requests.post(f"{BRIDGE_URL}/soft-reset")
             flag = 1
             return
 
@@ -242,7 +265,7 @@ def clean_hex_data(data):
     return re.sub(r'[^0-9A-Fa-f]', '', data)
 
 def retry_connection():
-    global bus, retry_count
+    global bus, retry_count, ping_active_flag
     print("\nPCAN hardware disconnected!")
     while True:
         print(f"Attempting to reconnect PCAN hardware... (Attempt {retry_count + 1})")
@@ -256,6 +279,8 @@ def retry_connection():
             print("PCAN reconnection successful!")
             send_status("pcan_connected")
             retry_count = 0
+            # Restart ping thread with new bus
+            threading.Thread(target=ping_thread, args=(bus,), daemon=True).start()
             return True
         else:
             retry_count += 1
@@ -283,8 +308,36 @@ def check_connection():
             send_status("pcan_failed")
             break
 
+def send_ping(bus):
+    """Send ping message to keep unit in bootloader state"""
+    try:
+        # Using a different CAN ID for ping messages (0x19999999)
+        ping_msg = can.Message(arbitration_id=0x19999999, data=[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08], is_extended_id=True)
+        bus.send(ping_msg)
+        print("📡 Ping sent to keep unit in bootloader state", end='\r')
+    except Exception as e:
+        print(f"Error sending ping: {e}")
+
+def ping_thread(bus):
+    """Separate thread for sending ping messages continuously"""
+    global ping_active_flag
+    while True:
+        try:
+            if ping_active_flag[0] and bus:
+                # Check if bus is still valid before sending
+                try:
+                    bus.status()
+                    send_ping(bus)
+                except:
+                    # Bus is no longer valid, wait for reconnection
+                    pass
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"Error in ping thread: {e}")
+            time.sleep(1)
+
 def main():
-    global bus, flag, flashing_flag
+    global bus, flag, flashing_flag, ping_active_flag
     bus = init_CAN_bus()
     if not bus:
         send_status("pcan_failed")
@@ -293,15 +346,21 @@ def main():
     unit_id = None
     idle_counter = 0
     threading.Thread(target=check_connection, daemon=True).start()
+    threading.Thread(target=ping_thread, args=(bus,), daemon=True).start()
     while True:
         if flag == 1:
             if retry_connection():
                 flag = 0
                 threading.Thread(target=check_connection, daemon=True).start()
+                threading.Thread(target=ping_thread, args=(bus,), daemon=True).start()
                 continue
             else:
                 continue
-        cmd = poll_next_command()
+        cmd, ping_active = poll_next_command()
+        
+        # Update ping flag based on bridge status
+        ping_active_flag[0] = ping_active
+        
         if not cmd:
             idle_counter += 1
             if idle_counter % 30 == 0:
@@ -315,6 +374,10 @@ def main():
             unit_id = scan_for_unit_id(bus)
             if not unit_id:
                 send_status("unit_not_found")
+        elif cmd == "idle":
+            # Wait for user to initiate handshake from frontend
+            time.sleep(1)
+            continue
         elif cmd == "send_security_key" and unit_id:
             key_bytes = fetch_security_key(unit_id)
             if key_bytes:

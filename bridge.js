@@ -12,13 +12,15 @@ app.use(express.json());
 app.use(cors());
 
 let bridgeState = {
-  command: "scan_unit",
+  command: "idle",
   unit_id: null,
   metadata: null,
   status: null,
   firmware_file: null,
   pcan_connected: false,
-  frontend_firmware_selected: false
+  frontend_firmware_selected: false,
+  flashing_progress: null,
+  ping_active: false
 };
 
 const VALID_UNIT_IDS = {
@@ -34,14 +36,22 @@ const COMMON_SECURITY_KEY = [255, 255, 0, 0, 0, 0, 0, 0];
 // Client polls this endpoint to get the next command
 app.get("/next-command", (req, res) => {
   console.log(`📡 Client polling for command. Current command: ${bridgeState.command}`);
-  res.json({ command: bridgeState.command });
+  res.json({ 
+    command: bridgeState.command,
+    ping_active: bridgeState.ping_active
+  });
 });
 
 // Trigger full handshake sequence from frontend
 app.post("/api/initiate-handshake", (req, res) => {
-  if (bridgeState.command !== "scan_unit") {
+  if (bridgeState.command === "idle" || bridgeState.command === "scan_unit") {
+    // Clear metadata when starting a new handshake
+    bridgeState.metadata = null;
+    bridgeState.unit_id = null;
     bridgeState.command = "scan_unit";
+    bridgeState.ping_active = true; // Start ping messages
     console.log("🟢 Handshake initiated by frontend.");
+    console.log("📡 Ping messages activated to keep unit in bootloader state.");
     res.json({ success: true, message: "Handshake started." });
   } else {
     res.json({ success: false, message: "Handshake already in progress." });
@@ -133,6 +143,14 @@ app.post("/status", (req, res) => {
   res.send({ ok: true });
 });
 
+// Endpoint for client to report flashing progress
+app.post("/flashing-progress", (req, res) => {
+  const { status, percentage, frames, total_frames } = req.body;
+  bridgeState.flashing_progress = { status, percentage, frames, total_frames };
+  console.log(`📊 Flashing Progress: ${status} - ${percentage}% (${frames}/${total_frames} frames)`);
+  res.send({ ok: true });
+});
+
 // Frontend endpoints
 app.get("/api/pcan-status", (req, res) => {
   res.json({ connected: bridgeState.pcan_connected });
@@ -150,8 +168,13 @@ app.get("/api/bridge-status", (req, res) => {
     pcan_connected: bridgeState.pcan_connected,
     frontend_firmware_selected: bridgeState.frontend_firmware_selected,
     metadata: bridgeState.metadata ? true : false,
-    waiting_for_frontend: bridgeState.metadata && !bridgeState.firmware_file
+    waiting_for_frontend: bridgeState.metadata && !bridgeState.firmware_file,
+    ping_active: bridgeState.ping_active
   });
+});
+
+app.get("/api/flashing-progress", (req, res) => {
+  res.json({ progress: bridgeState.flashing_progress });
 });
 
 app.get("/api/firmwares", (req, res) => {
@@ -177,6 +200,7 @@ app.post("/api/update-firmware", (req, res) => {
   bridgeState.firmware_file = firmware_file;
   bridgeState.frontend_firmware_selected = true;
   bridgeState.command = "download_firmware";
+  bridgeState.flashing_progress = null;
   console.log(`✅ Firmware selected via frontend: ${firmware_file}`);
   console.log(`🔄 Bridge command set to: ${bridgeState.command}`);
   console.log(`📋 Waiting for client to poll /next-command...`);
@@ -185,9 +209,41 @@ app.post("/api/update-firmware", (req, res) => {
 
 // Resets the bridge state
 app.post("/reset", (req, res) => {
-  bridgeState = { command: "scan_unit", unit_id: null, metadata: null, status: null, firmware_file: null, pcan_connected: false, frontend_firmware_selected: false };
+  bridgeState = { 
+    command: "idle", 
+    unit_id: null, 
+    metadata: null, 
+    status: null, 
+    firmware_file: null, 
+    pcan_connected: false, 
+    frontend_firmware_selected: false, 
+    flashing_progress: null,
+    ping_active: false
+  };
   console.log("Bridge state reset.");
   res.json({ reset: true });
+});
+
+// Soft reset that preserves metadata and unit info
+app.post("/soft-reset", (req, res) => {
+  const preservedMetadata = bridgeState.metadata;
+  const preservedUnitId = bridgeState.unit_id;
+  const preservedPcanStatus = bridgeState.pcan_connected;
+  const preservedPingStatus = bridgeState.ping_active;
+  
+  bridgeState = { 
+    command: "idle", 
+    unit_id: preservedUnitId, 
+    metadata: preservedMetadata, 
+    status: null, 
+    firmware_file: null, 
+    pcan_connected: preservedPcanStatus, 
+    frontend_firmware_selected: false, 
+    flashing_progress: null,
+    ping_active: preservedPingStatus
+  };
+  console.log("Bridge soft reset - metadata and unit info preserved.");
+  res.json({ reset: true, preserved: true });
 });
 
 // Clear firmware selection (useful after firmware update)
@@ -196,6 +252,22 @@ app.post("/api/clear-firmware", (req, res) => {
   bridgeState.frontend_firmware_selected = false;
   console.log("Firmware selection cleared.");
   res.json({ cleared: true });
+});
+
+// Clear metadata (useful for starting fresh)
+app.post("/api/clear-metadata", (req, res) => {
+  bridgeState.metadata = null;
+  bridgeState.unit_id = null;
+  console.log("Metadata cleared.");
+  res.json({ cleared: true });
+});
+
+// Control ping messages
+app.post("/api/ping-control", (req, res) => {
+  const { active } = req.body;
+  bridgeState.ping_active = active;
+  console.log(`📡 Ping messages ${active ? 'activated' : 'deactivated'}.`);
+  res.json({ success: true, ping_active: bridgeState.ping_active });
 });
 
 // Start the server
